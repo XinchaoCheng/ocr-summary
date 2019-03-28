@@ -1,4 +1,10 @@
 # ocr-summary
+
+
+### OCR简介
+
+Optical Character Recognition（光学字符识别），指对文本资料的图像文件进行分析识别处理，获取文字及版面信息的过程。
+OCR一般包含两步: 1. detection-->找到包含文字的区域(proposal); 2. classification-->识别区域中的文字。
 # Tensorflow: Adding a new op
 
 ## Steps
