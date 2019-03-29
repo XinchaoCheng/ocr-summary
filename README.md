@@ -5,7 +5,7 @@
 
 #### 1.1概述
 
-& nbsp；& nbsp；Optical Character Recognition（光学字符识别），指对文本资料的图像文件进行分析识别处理，获取文字及版面信息的过程。
+Optical Character Recognition（光学字符识别），指对文本资料的图像文件进行分析识别处理，获取文字及版面信息的过程。
 OCR一般包含两步: 1. detection-->找到包含文字的区域(proposal); 2. classification-->识别区域中的文字。
 
 #### 1.2好未来新版ocr
@@ -19,7 +19,164 @@ OCR一般包含两步: 1. detection-->找到包含文字的区域(proposal); 2. 
 
 由于网络输入图片的大小不一，有很多尺寸，使用原代码在GPU上运行时，检测部分每次推理是将整张图片当做输入。这样做虽然可以减小延时，但由于输入图片较大，占用的GPU显存资源较多，因此在多路时无法大幅度提高吞吐（qps）。为了减小内存的占用，同时适配MLU100板卡不能多尺度的问题（虽然每个尺度可以生成一个指令catch集，但因为图片大小非常不同，无法为每个尺度都生成一个指令集），使用了滑窗方法去分割图片。
 
-滑窗方式就是利用一个固定大小的window以滑动的方式去截取数据。滑动过程中，需要设置重叠值，即overlap数值，保证不因为滑窗而丢失信息。当window超出图片范围时，未覆盖的地方填零，这样可将不同大小的图片分割成一系列相同大小的窗口，即检测网络每次推理过程输入的shape均为固定值，无需生成新的指令catch集。当将一张图片分成几个相同大小的部分进行推理后，需将这几个部分结果重新拼接起来，一块送入识别网络。这就需要记录每个窗口的相对位置和scale尺度，然后将四个坐标值从窗口的相对位置转换到完整图片的绝对位置。具体代码可参考public_fix_shape.py文档，代码部分截图如下图1所示。
+滑窗方式就是利用一个固定大小的window以滑动的方式去截取数据。滑动过程中，需要设置重叠值，即overlap数值，保证不因为滑窗而丢失信息。当window超出图片范围时，未覆盖的地方填零，这样可将不同大小的图片分割成一系列相同大小的窗口，即检测网络每次推理过程输入的shape均为固定值，无需生成新的指令catch集。当将一张图片分成几个相同大小的部分进行推理后，需将这几个部分结果重新拼接起来，一块送入识别网络。这就需要记录每个窗口的相对位置和scale尺度，然后将四个坐标值从窗口的相对位置转换到完整图片的绝对位置。具体代码可参考public_fix_shape.py文档，代码部分截图如下所示。
+
+```cc
+def detect_box(input_image, input_net, max_accept_size, over_lap_rate, input_scale=1):
+    img_height = int(input_image.shape[0] * input_scale)
+    img_width  = int(input_image.shape[1] * input_scale)
+    if SHOW_DEBUG_INFO:
+        print "[public.detect_box]: orginal size: h {},w {}".format(img_height, img_width)
+    img_size = img_height * img_width
+
+    # preprocess the orginal image data
+    transformer = caffe.io.Transformer({'data': (1, 3, img_height, img_width)})
+    transformer.set_transpose('data', (2, 0, 1))
+    if device_type!=2:
+        transformer.set_mean('data', np.array([104, 117, 123]))  # mean pixel
+
+    transformed_image = transformer.preprocess('data', input_image)
+
+    box_list = []
+    unit_height = 400 # this value should same with the 3th dimension of input data in caffe prototxt
+    unit_width  = 400 # this value should same with the 4th dimension of input data in caffe prototxt
+    x_overlap = 30
+    y_overlap = 30
+    if device_type!=2:
+        data_paraller = 1
+    else:
+        data_paraller = 3*int(os.environ["MLU_CAFFE_DP"]) # first value should same with the first dimension of input data in caffe prototxt
+    # untill now, cpu and gpu can only set data_paraller to 1
+    if True:
+        y_min = 0
+        while y_min < (img_height):
+            x_min = 0
+            y_max = min(y_min + unit_height + y_overlap, img_height)
+            while x_min < (img_width):
+                x_max = min(x_min + unit_width + x_overlap, img_width)
+                box_list.append([x_min, y_min, x_max, y_max])
+                x_min += unit_width
+            y_min += unit_height
+
+    # forward
+    box_len = len(box_list)
+    detections = np.array([])
+    roi_img_list = np.array([])
+    x_offset_list = []
+    y_offset_list = []
+    x_scale_list = []
+    y_scale_list = []
+    separate_location_list=[]
+    separate_location_list.append(0)
+    count = 0
+    remainder = box_len % data_paraller
+    if remainder != 0:
+        if box_len>data_paraller:
+            for i in range(remainder):
+                box_list.append([0, 0, 0, 0])
+        else:
+            for i in range(data_paraller-remainder):
+                box_list.append([0, 0, 0, 0])
+    if box_len>0:
+        inv_img_width = 1.0 / img_width
+        inv_img_height = 1.0 / img_height
+        for box in box_list:
+            if box[2]-box[0]<(unit_width+x_overlap) or box[3]-box[1]<(unit_height+y_overlap):
+                if box[2]<(unit_height+y_overlap) or box[3]<(unit_width+x_overlap):
+                    roi_img = np.zeros( (3,unit_height+y_overlap,unit_width+x_overlap) )
+                    bias_x = box[2]-box[0]
+                    bias_y = box[3]-box[1]
+
+                    roi_img[:,0:bias_y,0:bias_x] = copy.deepcopy(transformed_image[:,box[1]:box[3],box[0]:box[2]])
+                    x_offset = box[0] * inv_img_width
+                    y_offset = box[1] * inv_img_height
+                    x_scale = (unit_width+x_overlap) * inv_img_width
+                    y_scale = (unit_height+y_overlap) * inv_img_height
+
+                else:
+                    bias_x = box[0]
+                    bias_y = box[1]
+                    box[0] = box[2]-unit_width-x_overlap
+                    box[1] = box[3]-unit_height-y_overlap
+                    roi_img = copy.deepcopy(transformed_image[:,box[1]:box[3],box[0]:box[2]]) #box contains four numbers means the location of an img
+                    roi_img[:,0:bias_y-box[1],:] = 0
+                    roi_img[:,:,0:bias_x-box[0]] = 0
+
+                    x_offset = box[0] * inv_img_width
+                    y_offset = box[1] * inv_img_height
+                    x_scale = (unit_width+x_overlap) * inv_img_width
+                    y_scale = (unit_height+y_overlap) * inv_img_height
+            else:
+                roi_img = transformed_image[:,box[1]:box[3],box[0]:box[2]] #box contains four numbers means the location of an img
+
+                x_offset = box[0] * inv_img_width
+                y_offset = box[1] * inv_img_height
+                x_scale = (box[2] - box[0]) * inv_img_width
+                y_scale = (box[3] - box[1]) * inv_img_height
+            if len(roi_img_list)==0:
+                roi_img_list = roi_img.copy()
+            else:
+                roi_img_list = np.concatenate((roi_img_list, roi_img), axis=0)           
+            x_offset_list.append(x_offset)
+            y_offset_list.append(y_offset)
+            x_scale_list.append(x_scale)
+            y_scale_list.append(y_scale)
+            count +=1
+            if count == data_paraller:
+                count = 0
+                roi_img_list = np.reshape(roi_img_list,(data_paraller,3,unit_height+y_overlap,unit_width+x_overlap))
+                input_net.blobs['data'].data[...] = roi_img_list
+                sub_detections_ = input_net.forward()['detection_out']
+
+                if device_type!=2:
+                    sub_detections=sub_detections_
+                else:
+                    for i in range(data_paraller):
+                        temp = sub_detections_[np.where(sub_detections_[i:i+1,:,:,4]>0)].shape[0] + separate_location_list[i]
+                        separate_location_list.append(temp)
+                    
+                    sub_detections_=sub_detections_[np.where(sub_detections_[:,:,:,4]>0)]
+                    sub_detections_=sub_detections_[np.newaxis,np.newaxis, :]  
+                        
+                    new_shape=list(sub_detections_.shape)
+                    new_shape[-1]=7
+                    
+                    new_detections=np.zeros(new_shape)
+                    new_detections[0,0,:,0]=0
+                    new_detections[0,0,:,3:7]=sub_detections_[0,0,:,0:4]
+                    new_detections[0,0,:,1]=sub_detections_[0,0,:,5]
+                    new_detections[0,0,:,2]=sub_detections_[0,0,:,4]
+                            
+                    sub_detections=new_detections
+
+                if device_type!=2:
+                    for i in range(data_paraller):
+                        sub_detections[i, 0, :, 3] = sub_detections[i, 0, :, 3]*x_scale_list[i] + x_offset_list[i]
+                        sub_detections[i, 0, :, 4] = sub_detections[i, 0, :, 4]*y_scale_list[i] + y_offset_list[i]
+                        sub_detections[i, 0, :, 5] = sub_detections[i, 0, :, 5]*x_scale_list[i] + x_offset_list[i]
+                        sub_detections[i, 0, :, 6] = sub_detections[i, 0, :, 6]*y_scale_list[i] + y_offset_list[i]
+                else:
+                    for i in range(data_paraller):
+                        sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 3] = sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 3]*x_scale_list[i] + x_offset_list[i]
+                        sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 4] = sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 4]*y_scale_list[i] + y_offset_list[i]
+                        sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 5] = sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 5]*x_scale_list[i] + x_offset_list[i]
+                        sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 6] = sub_detections[0, 0, separate_location_list[i]:separate_location_list[i+1], 6]*y_scale_list[i] + y_offset_list[i]
+
+                if len(detections)==0:
+                    detections = sub_detections.copy()
+                else:
+                    detections = np.concatenate((detections, sub_detections), axis=2)
+                x_offset_list = []
+                y_offset_list = []
+                x_scale_list = []
+                y_scale_list = []
+                separate_location_list = []
+                separate_location_list.append(0)
+                roi_img_list = np.array([])
+    else:
+        print("Wrong!! box_list cannot be empty")
+    return detections
+```
 
 该滑窗的实现代码同时适配CPU，MLU和GPU版本，同时在MLU上还支持数据并行度大于一的情况，即检测网络一次推理过程同时处理多个窗口，进一步减小延时。注意，当检测部分（基于caffe框架）MLU数据并行度大于一时，并行度的值需与模型prototxt中input的第一个dimension值相同；最后两个维度需与滑窗大小值（unit_width+x_overlap）设置相同。经过滑窗（430*430，不同尺寸会有不同精度）处理后，单尺度下的错误率从14.6%下降到12.54%；在1080Ti上，1000张测试图片平均端到端延时从0.1s上升到0.16s；在MLUd3卡上平均端到端时间为0.3442s。当使用变换的scale时（将图片的长边transform为2000，短边缩放相同比例），MLU上的错误率约为10.15%；GPU上为9.91%，不使用滑窗时为9.18%
 
