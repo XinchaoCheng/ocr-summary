@@ -5,12 +5,12 @@
 
 #### 1.1概述
 
-        Optical Character Recognition（光学字符识别），指对文本资料的图像文件进行分析识别处理，获取文字及版面信息的过程。
-    OCR一般包含两步: 1. detection-->找到包含文字的区域(proposal); 2. classification-->识别区域中的文字。
+   Optical Character Recognition（光学字符识别），指对文本资料的图像文件进行分析识别处理，获取文字及版面信息的过程。
+OCR一般包含两步: 1. detection-->找到包含文字的区域(proposal); 2. classification-->识别区域中的文字。
 
 #### 1.2好未来新版ocr
-        检测部分使用ssd inception-v2模型，识别部分采用基于attention的分类模型。检测部分，ssd经过preprocess后，会将图片resize成（1,300,300,3）的shape送入卷积层，经过nms等处理后输出100个框的坐标和对应分数；后处理包括文本结构识别等一系列操作，生成行检测信息送入识别网络。
-        识别网络，前处理包括对输入逐行进行灰度和resize处理，对label进行编码操作，以及使用滑窗处理逐行图片的过程。前处理后输入变为（n,32,32,1）的形式；推理完成后output为（n，36），prob为（n,36,3677）。默认每行最多有36个字，3为终止符号。prob的最大值对应的index即为output的值。最后根据编码输出对应的字符，完成单张图的识别。
+   检测部分使用ssd inception-v2模型，识别部分采用基于attention的分类模型。检测部分，ssd经过preprocess后，会将图片resize成（1,300,300,3）的shape送入卷积层，经过nms等处理后输出100个框的坐标和对应分数；后处理包括文本结构识别等一系列操作，生成行检测信息送入识别网络。
+   识别网络，前处理包括对输入逐行进行灰度和resize处理，对label进行编码操作，以及使用滑窗处理逐行图片的过程。前处理后输入变为（n,32,32,1）的形式；推理完成后output为（n，36），prob为（n,36,3677）。默认每行最多有36个字，3为终止符号。prob的最大值对应的index即为output的值。最后根据编码输出对应的字符，完成单张图的识别。
 # Tensorflow: Adding a new op
 
 ## Steps
